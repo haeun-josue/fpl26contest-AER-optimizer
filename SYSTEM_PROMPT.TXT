@@ -1,0 +1,8 @@
+exp29 deterministic framework (2026-08-09; exp27 lineage).
+
+This strategy does not use the LLM conversation loop: the whole optimization is
+decided and executed inside optimize() by a deterministic framework
+(size tiers giant/mid/small -> parallel first action with a common gate ->
+observation-pool rules for later actions and route-directive decisions), with a
+single one-shot LLM completion call for the first-action judgment. This file is
+therefore never loaded at runtime; it exists to satisfy the template contract.

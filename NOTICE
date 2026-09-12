@@ -1,0 +1,12 @@
+Team AER — FPL'26 Agentic FPGA Backend Optimization Competition submission
+Copyright 2026 Team AER (Sookwan Han, Haeun Ji, Jun Sung, Sihun Lim)
+
+This repository is derived from the contest template published by AMD at
+https://github.com/Xilinx/fpl26_optimization_contest (Apache License 2.0).
+AMD's copyright notices in the retained files are unchanged.
+
+Modified by Team AER: dcp_optimizer.py, SYSTEM_PROMPT.TXT, requirements.txt (3 files)
+Written by Team AER:  CustomToolMCP/tools/_fpl_knowledge.py, _fpl_llm_arm.py, _fpl_rules.py
+
+RapidWright (https://github.com/Xilinx/RapidWright) is linked as a git submodule
+and is not distributed in this repository.

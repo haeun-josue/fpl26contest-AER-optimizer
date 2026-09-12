@@ -1,0 +1,378 @@
+# Makefile for FPGA Design Optimization Agent
+
+# Configuration
+PYTHON := python3
+PIP := $(PYTHON) -m pip
+
+# Vivado executable - can be overridden with: make setup VIVADO_EXEC=/path/to/vivado
+VIVADO_EXEC ?= vivado
+export VIVADO_EXEC
+
+# Set JAVA_HOME from PATH or Vivado if not already set
+# Python RapidWright may need JAVA_HOME to be set, but often users only have `java` on PATH
+# See: https://www.rapidwright.io/docs/Install.html#using-java-distributed-with-vivado
+ifndef JAVA_HOME
+  JAVA_PATH := $(shell command -v java 2>/dev/null)
+  ifneq ($(JAVA_PATH),)
+    # Found java on PATH - resolve symlinks and derive JAVA_HOME
+    # Try readlink -f (Linux), fall back to direct path (macOS/others)
+    REAL_JAVA_PATH := $(shell readlink -f "$(JAVA_PATH)" 2>/dev/null || readlink "$(JAVA_PATH)" 2>/dev/null || echo "$(JAVA_PATH)")
+    # java is at $JAVA_HOME/bin/java, so go up two directories
+    export JAVA_HOME := $(shell dirname $(shell dirname $(REAL_JAVA_PATH)))
+  else
+    # java not on PATH - try to find Java bundled with Vivado
+    # Vivado includes Java at: <VIVADO_ROOT>/tps/lnx64/jre11*/bin/java
+    VIVADO_PATH := $(shell command -v $(VIVADO_EXEC) 2>/dev/null)
+    ifneq ($(VIVADO_PATH),)
+      VIVADO_ROOT := $(shell dirname $(shell dirname $(VIVADO_PATH)))
+      VIVADO_JAVA := $(shell ls $(VIVADO_ROOT)/tps/lnx64/jre11*/bin/java 2>/dev/null | head -n 1)
+      ifneq ($(VIVADO_JAVA),)
+        export JAVA_HOME := $(shell dirname $(shell dirname $(VIVADO_JAVA)))
+        export PATH := $(JAVA_HOME)/bin:$(PATH)
+      endif
+    endif
+  endif
+endif
+
+# RapidWright submodule path and classpath
+# Points the Python rapidwright package to use the local RapidWright source
+# See: https://www.rapidwright.io/docs/Install_RapidWright_as_a_Python_PIP_Package.html#java-development-and-python
+RAPIDWRIGHT_PATH := $(CURDIR)/RapidWright
+export RAPIDWRIGHT_PATH
+export CLASSPATH := $(RAPIDWRIGHT_PATH)/bin:$(RAPIDWRIGHT_PATH)/jars/*
+
+# Benchmark archive from GitHub release
+BENCHMARK_VERSION := v1.0.0
+BENCHMARK_TARBALL := fpl26_contest_benchmarks_$(BENCHMARK_VERSION).tar.gz
+BENCHMARK_DIR := fpl26_contest_benchmarks
+BENCHMARK_URL := https://github.com/Xilinx/fpl26_optimization_contest/releases/download/$(BENCHMARK_VERSION)/$(BENCHMARK_TARBALL)
+
+# Example DCP paths (inside the extracted benchmark directory)
+EXAMPLE_DCP_1 := $(BENCHMARK_DIR)/logicnets_jscl_2025.1.dcp
+EXAMPLE_DCP_2 := $(BENCHMARK_DIR)/vexriscv_re-place_2025.1.dcp
+
+# Colors for output
+COLOR_GREEN := \033[0;32m
+COLOR_YELLOW := \033[0;33m
+COLOR_RED := \033[0;31m
+COLOR_BLUE := \033[0;34m
+COLOR_RESET := \033[0m
+
+.PHONY: setup build-rapidwright run_optimizer run_test validate validate_demo run-submission clean veryclean help
+
+# Default target
+help:
+	@echo "FPGA Design Optimization Agent - Makefile"
+	@echo ""
+	@echo "Available targets:"
+	@echo "  setup              - Install dependencies, build RapidWright, download example DCPs"
+	@echo "  build-rapidwright  - Build RapidWright from source (git submodule)"
+	@echo "  run_optimizer      - Run optimizer on a DCP file (LLM-guided, requires API key)"
+	@echo "  run_test           - Run optimizer in test mode (no LLM, hardcoded optimization)"
+	@echo "  validate           - Validate functional equivalence between two DCPs"
+	@echo "  validate_demo      - Run validation demo (self-check)"
+	@echo "  clean              - Remove generated files (run directories, logs, Vivado outputs)"
+	@echo "  veryclean          - Remove all generated files including example DCPs"
+	@echo ""
+	@echo "Usage examples:"
+	@echo "  make setup"
+	@echo "  make setup VIVADO_EXEC=/tools/Xilinx/Vivado/2025.2/bin/vivado"
+	@echo "  make run_optimizer DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"
+	@echo "  make run_test DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"
+	@echo "  make run_test DCP=fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp"
+	@echo "  make validate GOLDEN=design.dcp REVISED=design_optimized.dcp"
+	@echo "  make validate GOLDEN=design.dcp REVISED=design_optimized.dcp VECTORS=50000"
+	@echo "  make validate_demo"
+	@echo "  make clean"
+	@echo ""
+	@echo "Environment variables:"
+	@echo "  VIVADO_EXEC     - Path to Vivado executable (default: vivado)"
+	@echo "  JAVA_HOME       - Java installation directory (auto-detected from PATH if not set)"
+	@echo "  DCP             - Input DCP file for run_optimizer / run_test targets"
+	@echo "  MAX_NETS        - Max high fanout nets to optimize in test mode (default: 5)"
+	@echo "  GOLDEN          - Golden (reference) DCP for validation"
+	@echo "  REVISED         - Revised (optimized) DCP for validation"
+	@echo "  VECTORS         - Number of test vectors for validation (default: 200)"
+	@echo ""
+	@echo "Output structure:"
+	@echo "  - Optimized DCP: <input_name>_optimized-<timestamp>.dcp (next to input)"
+	@echo "  - Run directory: dcp_optimizer_run-<timestamp>/ (contains all logs)"
+	@echo "  - Validation:    /tmp/dcp_validation_*/ (contains simulation logs)"
+
+# Setup target: Install dependencies, check Vivado, set up Java, build RapidWright, download DCPs
+setup:
+	@printf "$(COLOR_GREEN)===== FPGA Design Optimization Setup =====$(COLOR_RESET)\n"
+	@echo ""
+	
+	@printf "$(COLOR_YELLOW)[1/5] Installing Python dependencies...$(COLOR_RESET)\n"
+	$(PIP) install -r requirements.txt
+	@printf "$(COLOR_GREEN)✓ Python dependencies installed$(COLOR_RESET)\n"
+	@echo ""
+	
+	@printf "$(COLOR_YELLOW)[2/5] Checking Vivado...$(COLOR_RESET)\n"
+	@if command -v $(VIVADO_EXEC) >/dev/null 2>&1; then \
+		printf "$(COLOR_GREEN)✓ Vivado found: %s$(COLOR_RESET)\n" "$$(command -v $(VIVADO_EXEC))"; \
+		$(VIVADO_EXEC) -version | head -n 1; \
+	else \
+		printf "$(COLOR_RED)✗ Vivado not found on PATH$(COLOR_RESET)\n"; \
+		echo ""; \
+		echo "Please either:"; \
+		echo "  1. Source Vivado settings: source /path/to/Vivado/*/settings64.sh"; \
+		echo "  2. Specify Vivado path: make setup VIVADO_EXEC=/path/to/vivado"; \
+		exit 1; \
+	fi
+	@echo ""
+	
+	@printf "$(COLOR_YELLOW)[3/5] Checking Java...$(COLOR_RESET)\n"
+	@if command -v java >/dev/null 2>&1; then \
+		printf "$(COLOR_GREEN)✓ Java found: %s$(COLOR_RESET)\n" "$$(command -v java)"; \
+		java -version 2>&1 | head -n 1; \
+	else \
+		printf "$(COLOR_YELLOW)⚠ Java not found on PATH$(COLOR_RESET)\n"; \
+		echo "Attempting to locate Java from Vivado installation..."; \
+		VIVADO_PATH=$$(command -v $(VIVADO_EXEC)); \
+		if [ -n "$$VIVADO_PATH" ]; then \
+			VIVADO_BIN_DIR=$$(dirname $$VIVADO_PATH); \
+			VIVADO_ROOT=$$(dirname $$VIVADO_BIN_DIR); \
+			VIVADO_JAVA="$$VIVADO_ROOT/tps/lnx64/jre11*/bin/java"; \
+			if ls $$VIVADO_JAVA >/dev/null 2>&1; then \
+				JAVA_FOUND=$$(ls $$VIVADO_JAVA | head -n 1); \
+				printf "$(COLOR_GREEN)✓ Found Java in Vivado: %s$(COLOR_RESET)\n" "$$JAVA_FOUND"; \
+				echo ""; \
+				printf "$(COLOR_YELLOW)NOTE: Set JAVA_HOME before running optimizer:$(COLOR_RESET)\n"; \
+				JAVA_HOME_DIR=$$(dirname $$(dirname $$JAVA_FOUND)); \
+				echo "  export JAVA_HOME=$$JAVA_HOME_DIR"; \
+				echo "  export PATH=\$$JAVA_HOME/bin:\$$PATH"; \
+			else \
+				printf "$(COLOR_RED)✗ Could not find Java in Vivado installation$(COLOR_RESET)\n"; \
+				echo "Please install Java 11 or later"; \
+				exit 1; \
+			fi; \
+		else \
+			printf "$(COLOR_RED)✗ Cannot locate Java$(COLOR_RESET)\n"; \
+			echo "Please install Java 11 or later"; \
+			exit 1; \
+		fi; \
+	fi
+	@echo ""
+	
+	@printf "$(COLOR_YELLOW)[4/5] Building RapidWright from source...$(COLOR_RESET)\n"
+	@$(MAKE) build-rapidwright
+	@echo ""
+	
+	@printf "$(COLOR_YELLOW)[5/5] Downloading and extracting benchmark DCPs...$(COLOR_RESET)\n"
+	@if [ -d "$(BENCHMARK_DIR)" ] && [ -f "$(EXAMPLE_DCP_1)" ]; then \
+		printf "$(COLOR_GREEN)✓ $(BENCHMARK_DIR)/ already exists$(COLOR_RESET)\n"; \
+	else \
+		if [ ! -f "$(BENCHMARK_TARBALL)" ]; then \
+			printf "Downloading $(BENCHMARK_TARBALL)...\n"; \
+			if command -v wget >/dev/null 2>&1; then \
+				wget -q --show-progress $(BENCHMARK_URL); \
+			elif command -v curl >/dev/null 2>&1; then \
+				curl -# -L -O $(BENCHMARK_URL); \
+			else \
+				printf "$(COLOR_RED)✗ Neither wget nor curl found$(COLOR_RESET)\n"; \
+				echo "Please install wget or curl, or manually download:"; \
+				echo "  $(BENCHMARK_URL)"; \
+				exit 1; \
+			fi; \
+		fi; \
+		printf "Extracting $(BENCHMARK_TARBALL)...\n"; \
+		tar xzf $(BENCHMARK_TARBALL); \
+		printf "$(COLOR_GREEN)✓ Benchmarks extracted to $(BENCHMARK_DIR)/$(COLOR_RESET)\n"; \
+	fi
+	@echo ""
+	
+	@printf "$(COLOR_GREEN)===== Setup Complete! =====$(COLOR_RESET)\n"
+	@echo ""
+	@echo "Next steps - run the optimizer:"
+	@echo ""
+	@echo "  Test mode (no API key required):"
+	@echo "    make run_test DCP=$(EXAMPLE_DCP_1)"
+	@echo "    make run_test DCP=$(EXAMPLE_DCP_2)"
+	@echo ""
+	@echo "  Full LLM-guided optimizer (requires OPENROUTER_API_KEY):"
+	@echo "    make run_optimizer DCP=$(EXAMPLE_DCP_1)"
+	@echo ""
+	@echo "Output will be in:"
+	@echo "  - Optimized DCP: <input_name>_optimized-<timestamp>.dcp"
+	@echo "  - Run logs: dcp_optimizer_run-<timestamp>/"
+	@echo ""
+
+# Build RapidWright from source (git submodule)
+build-rapidwright:
+	@printf "$(COLOR_YELLOW)Building RapidWright from source...$(COLOR_RESET)\n"
+	@if [ ! -f "$(RAPIDWRIGHT_PATH)/gradlew" ]; then \
+		printf "$(COLOR_YELLOW)Initializing RapidWright git submodule...$(COLOR_RESET)\n"; \
+		git submodule update --init RapidWright; \
+	fi
+	@cd "$(RAPIDWRIGHT_PATH)" && ./gradlew compileJava -p "$(RAPIDWRIGHT_PATH)"
+	@printf "$(COLOR_GREEN)✓ RapidWright built successfully$(COLOR_RESET)\n"
+	@printf "$(COLOR_GREEN)  RAPIDWRIGHT_PATH=$(RAPIDWRIGHT_PATH)$(COLOR_RESET)\n"
+	@printf "$(COLOR_GREEN)  CLASSPATH=$(CLASSPATH)$(COLOR_RESET)\n"
+
+# Run optimizer target: Run dcp_optimizer.py (output DCP name generated automatically)
+run_optimizer: 
+	@if [ -z "$(DCP)" ]; then \
+		printf "$(COLOR_RED)Error: DCP variable not set$(COLOR_RESET)\n"; \
+		echo "Usage: make run_optimizer DCP=input.dcp"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(DCP)" ]; then \
+		printf "$(COLOR_RED)Error: DCP file not found: $(DCP)$(COLOR_RESET)\n"; \
+		exit 1; \
+	fi
+	@printf "$(COLOR_GREEN)Running optimizer on $(DCP)...$(COLOR_RESET)\n"
+	@# Set up Java from Vivado if Java is not available
+	@if ! command -v java >/dev/null 2>&1; then \
+		printf "$(COLOR_YELLOW)Java not found on PATH, attempting to use Java from Vivado...$(COLOR_RESET)\n"; \
+		VIVADO_PATH=$$(command -v $(VIVADO_EXEC) 2>/dev/null); \
+		if [ -n "$$VIVADO_PATH" ]; then \
+			VIVADO_BIN_DIR=$$(dirname $$VIVADO_PATH); \
+			VIVADO_ROOT=$$(dirname $$VIVADO_BIN_DIR); \
+			VIVADO_JAVA="$$VIVADO_ROOT/tps/lnx64/jre11*/bin/java"; \
+			if ls $$VIVADO_JAVA >/dev/null 2>&1; then \
+				JAVA_FOUND=$$(ls $$VIVADO_JAVA | head -n 1); \
+				export JAVA_HOME=$$(dirname $$(dirname $$JAVA_FOUND)); \
+				export PATH="$$JAVA_HOME/bin:$$PATH"; \
+				printf "$(COLOR_GREEN)Using Java from Vivado: %s$(COLOR_RESET)\n" "$$JAVA_HOME"; \
+			fi; \
+		fi; \
+	fi; \
+	echo ""; \
+	$(PYTHON) dcp_optimizer.py "$(DCP)" 
+
+# Run test mode: Run dcp_optimizer.py with --test flag (no LLM required)
+run_test:
+	@if [ -z "$(DCP)" ]; then \
+		printf "$(COLOR_RED)Error: DCP variable not set$(COLOR_RESET)\n"; \
+		echo "Usage: make run_test DCP=input.dcp"; \
+		echo ""; \
+		echo "Supported example DCPs:"; \
+		echo "  make run_test DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp      # Pblock optimization"; \
+		echo "  make run_test DCP=fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp   # Cell re-placement"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(DCP)" ]; then \
+		printf "$(COLOR_RED)Error: DCP file not found: $(DCP)$(COLOR_RESET)\n"; \
+		exit 1; \
+	fi
+	@printf "$(COLOR_GREEN)Running optimizer in TEST MODE on $(DCP)...$(COLOR_RESET)\n"
+	@# Set up Java from Vivado if Java is not available
+	@if ! command -v java >/dev/null 2>&1; then \
+		printf "$(COLOR_YELLOW)Java not found on PATH, attempting to use Java from Vivado...$(COLOR_RESET)\n"; \
+		VIVADO_PATH=$$(command -v $(VIVADO_EXEC) 2>/dev/null); \
+		if [ -n "$$VIVADO_PATH" ]; then \
+			VIVADO_BIN_DIR=$$(dirname $$VIVADO_PATH); \
+			VIVADO_ROOT=$$(dirname $$VIVADO_BIN_DIR); \
+			VIVADO_JAVA="$$VIVADO_ROOT/tps/lnx64/jre11*/bin/java"; \
+			if ls $$VIVADO_JAVA >/dev/null 2>&1; then \
+				JAVA_FOUND=$$(ls $$VIVADO_JAVA | head -n 1); \
+				export JAVA_HOME=$$(dirname $$(dirname $$JAVA_FOUND)); \
+				export PATH="$$JAVA_HOME/bin:$$PATH"; \
+				printf "$(COLOR_GREEN)Using Java from Vivado: %s$(COLOR_RESET)\n" "$$JAVA_HOME"; \
+			fi; \
+		fi; \
+	fi; \
+	echo ""; \
+	$(PYTHON) dcp_optimizer.py "$(DCP)" --test $(if $(MAX_NETS),--max-nets $(MAX_NETS))
+
+# Validation target: Validate functional equivalence between two DCPs
+validate:
+	@printf "$(COLOR_BLUE)╔══════════════════════════════════════════════════════════════════╗$(COLOR_RESET)\n"
+	@printf "$(COLOR_BLUE)║         DCP Equivalence Validation (2-Phase Approach)            ║$(COLOR_RESET)\n"
+	@printf "$(COLOR_BLUE)╚══════════════════════════════════════════════════════════════════╝$(COLOR_RESET)\n"
+	@echo ""
+	@# Check if GOLDEN and REVISED are provided
+	@if [ -z "$(GOLDEN)" ]; then \
+		printf "$(COLOR_RED)✗ Error: GOLDEN DCP not specified$(COLOR_RESET)\n"; \
+		echo "Usage: make validate GOLDEN=<golden.dcp> REVISED=<revised.dcp> [VECTORS=200]"; \
+		echo ""; \
+		echo "Example:"; \
+		echo "  make validate GOLDEN=logicnets_jscl.dcp REVISED=logicnets_jscl_optimized.dcp"; \
+		exit 1; \
+	fi
+	@if [ -z "$(REVISED)" ]; then \
+		printf "$(COLOR_RED)✗ Error: REVISED DCP not specified$(COLOR_RESET)\n"; \
+		echo "Usage: make validate GOLDEN=<golden.dcp> REVISED=<revised.dcp> [VECTORS=200]"; \
+		echo ""; \
+		echo "Example:"; \
+		echo "  make validate GOLDEN=logicnets_jscl.dcp REVISED=logicnets_jscl_optimized.dcp"; \
+		exit 1; \
+	fi
+	@# Check if files exist
+	@if [ ! -f "$(GOLDEN)" ]; then \
+		printf "$(COLOR_RED)✗ Error: Golden DCP not found: $(GOLDEN)$(COLOR_RESET)\n"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(REVISED)" ]; then \
+		printf "$(COLOR_RED)✗ Error: Revised DCP not found: $(REVISED)$(COLOR_RESET)\n"; \
+		exit 1; \
+	fi
+	@# Run validation
+	@printf "$(COLOR_GREEN)Golden DCP:$(COLOR_RESET)  $(GOLDEN)\n"
+	@printf "$(COLOR_GREEN)Revised DCP:$(COLOR_RESET) $(REVISED)\n"
+	@printf "$(COLOR_GREEN)Test Vectors:$(COLOR_RESET) $(or $(VECTORS),200)\n"
+	@echo ""
+	@if [ -n "$(VECTORS)" ]; then \
+		$(PYTHON) validate_dcps.py "$(GOLDEN)" "$(REVISED)" --vectors $(VECTORS); \
+	else \
+		$(PYTHON) validate_dcps.py "$(GOLDEN)" "$(REVISED)"; \
+	fi
+
+# Quick validation example using demo DCPs
+validate_demo:
+	@printf "$(COLOR_BLUE)╔══════════════════════════════════════════════════════════════════╗$(COLOR_RESET)\n"
+	@printf "$(COLOR_BLUE)║                  Validation Demo (Simulated)                     ║$(COLOR_RESET)\n"
+	@printf "$(COLOR_BLUE)╚══════════════════════════════════════════════════════════════════╝$(COLOR_RESET)\n"
+	@echo ""
+	@echo "This demo validates a DCP against itself (should always PASS)."
+	@echo "For real validation, first optimize a design, then validate:"
+	@echo ""
+	@echo "  1. python dcp_optimizer.py design.dcp --output design_optimized.dcp"
+	@echo "  2. make validate GOLDEN=design.dcp REVISED=design_optimized.dcp"
+	@echo ""
+	@# Check if example DCP exists
+	@if [ ! -f "$(EXAMPLE_DCP_2)" ]; then \
+		printf "$(COLOR_YELLOW)Example DCP not found, downloading...$(COLOR_RESET)\n"; \
+		$(MAKE) download_dcps; \
+	fi
+	@# For demo, validate DCP against itself (should always pass)
+	@printf "$(COLOR_GREEN)Running demo validation (self-check)...$(COLOR_RESET)\n"
+	@echo ""
+	$(PYTHON) validate_dcps.py "$(EXAMPLE_DCP_2)" "$(EXAMPLE_DCP_2)" --vectors 1000
+
+run-submission:
+	@echo "Running submission...[Will be implemented later]"
+	
+# Clean target: Remove run directories and Vivado-generated .Xil directories
+clean:
+	@printf "$(COLOR_YELLOW)Cleaning generated files...$(COLOR_RESET)\n"
+	@# Remove run directories (contain all logs, journals, intermediate files)
+	@if ls dcp_optimizer_run-* >/dev/null 2>&1; then \
+		rm -rf dcp_optimizer_run-*; \
+		echo "Removed dcp_optimizer_run-* directories"; \
+	fi
+	@# Remove .Xil directories (Vivado generates these outside run directories)
+	@if [ -d ".Xil" ]; then \
+		rm -rf .Xil; \
+		echo "Removed .Xil/"; \
+	fi
+	@if [ -d "VivadoMCP/.Xil" ]; then \
+		rm -rf VivadoMCP/.Xil; \
+		echo "Removed VivadoMCP/.Xil/"; \
+	fi
+	@printf "$(COLOR_GREEN)✓ Clean complete$(COLOR_RESET)\n"
+	@echo "Note: Optimized DCP files were preserved"
+
+# Very clean target: Clean + remove __pycache__ and example DCPs
+veryclean: clean
+	@printf "$(COLOR_YELLOW)Performing deep clean...$(COLOR_RESET)\n"
+	@# Remove Python cache
+	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	@find . -type f -name "*.pyc" -delete 2>/dev/null || true
+	@echo "Removed __pycache__ directories"
+	@# Remove benchmark directory and tarball
+	@rm -rf $(BENCHMARK_DIR) $(BENCHMARK_TARBALL)
+	@echo "Removed benchmark directory and tarball"
+	@printf "$(COLOR_GREEN)✓ Deep clean complete$(COLOR_RESET)\n"
