@@ -11,6 +11,39 @@ The competition asks for an automated, agentic flow that takes a placed-and-rout
 frequency (Fmax), within a budget of one hour of runtime and one dollar of LLM cost
 per design. Submissions were scored on hidden benchmarks by the organizers.
 
+## Development process and key findings
+
+**Phase 1 — autoresearch meta-harness** 
+
+<!-- TODO. Sookwan -->
+
+**Phase 2 — phase 1 research-informed reconfiguration** 
+
+Starting from that harness, the rest of the work was hands-on: many small experiments on the public benchmarks, our beta submission, an analysis of the official beta results, and a final rewrite of the decision logic based on what we had measured. The final optimizer in this repository is the product of Phase 2.
+
+**Key findings — changes and observations across both phases.** 
+
+The following changes and observations, made over the course of the two phases,
+determined the final design:
+
+- **From an LLM agent to a rule-based framework.** The template's LLM conversation
+  loop was replaced by a deterministic framework; the LLM is consulted once, to
+  choose the first action. This made runtime and behaviour predictable and, as a
+  side effect, cut LLM cost.
+- **Stop when improvement stops.** Once an action has improved the design and the
+  next one does not, no further action is tried (in our measurements the third
+  action never helped, 0 of 11). This is where most of the runtime (γ) was saved.
+- **Window compaction does not work everywhere.** Packing the design into a small
+  pblock window brings little on some designs and fails outright on others (e.g.
+  fir_systolic_transposed), so the rule engine chooses between window compaction and
+  global re-placement from measured features rather than always trying the window
+  first.
+- **Which unplace command matters.** Vivado offers `place_design -unplace`
+  (unplaces every instance not locked by constraints) and `unplace_cell` (unplaces
+  the listed cells). In our measurements the two do not leave the design in the same
+  state, and which one works better depends on the design, so the command is chosen
+  per design.
+
 ## Results
 
 ### Final round (official, seven hidden benchmarks)
@@ -63,39 +96,6 @@ process exit.
 | vtr_mcml | +16.64 | 45.1 min (γ 0.752 h) | 15.39 |
 | ispd16_example2 | +107.97 | 46.6 min (γ 0.777 h) | 99.58 |
 | boom_soc | +27.91 | 33.6 min (γ 0.560 h) | 26.35 |
-
-## Development process and key findings
-
-**Phase 1 — autoresearch meta-harness** 
-
-<!-- TODO. Sookwan -->
-
-**Phase 2 — phase 1 research-informed reconfiguration** 
-
-Starting from that harness, the rest of the work was hands-on: many small experiments on the public benchmarks, our beta submission, an analysis of the official beta results, and a final rewrite of the decision logic based on what we had measured. The final optimizer in this repository is the product of Phase 2.
-
-**Key findings — changes and observations across both phases.** 
-
-The following changes and observations, made over the course of the two phases,
-determined the final design:
-
-- **From an LLM agent to a rule-based framework.** The template's LLM conversation
-  loop was replaced by a deterministic framework; the LLM is consulted once, to
-  choose the first action. This made runtime and behaviour predictable and, as a
-  side effect, cut LLM cost.
-- **Stop when improvement stops.** Once an action has improved the design and the
-  next one does not, no further action is tried (in our measurements the third
-  action never helped, 0 of 11). This is where most of the runtime (γ) was saved.
-- **Window compaction does not work everywhere.** Packing the design into a small
-  pblock window brings little on some designs and fails outright on others (e.g.
-  fir_systolic_transposed), so the rule engine chooses between window compaction and
-  global re-placement from measured features rather than always trying the window
-  first.
-- **Which unplace command matters.** Vivado offers `place_design -unplace`
-  (unplaces every instance not locked by constraints) and `unplace_cell` (unplaces
-  the listed cells). In our measurements the two do not leave the design in the same
-  state, and which one works better depends on the design, so the command is chosen
-  per design.
 
 ## Usage
 
