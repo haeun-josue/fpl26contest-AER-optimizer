@@ -13,11 +13,11 @@ per design. Submissions were scored on hidden benchmarks by the organizers.
 
 ## Development process and key findings
 
-**Phase 1 — autoresearch meta-harness** 
+**Phase 1 — autoresearch meta-harness with sparse human-feedback** 
 
 <!-- TODO. Sookwan -->
 
-**Phase 2 — phase 1 research-informed reconfiguration** 
+**Phase 2 — phase 1 research-informed reconfiguration and optimization** 
 
 Starting from that harness, the rest of the work was hands-on: many small experiments on the public benchmarks, our beta submission, an analysis of the official beta results, and a final rewrite of the decision logic based on what we had measured. The final optimizer in this repository is the product of Phase 2. In Phase 2, focused on enabling the final optimizer to achieve the beta 1st place, and we succeeded in doing so before the final submission.
 
